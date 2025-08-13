@@ -1,34 +1,6 @@
-defmodule Player do
-  defstruct age: 0, 
-            stack: [],
-            breakers: [],
-            dice_strategy: :highest_points,
-            hold: :greedy,
-            amount_of_invalid: 0,
-            amount_of_steal: 0,
-            amount_of_stack: 0,
-            wins: 0
-
-  @strategy_options %{
-    breakers: ~w/early_worm nil/a,
-    dice_strategy: ~w/high_dice_ratio highest_points random/a,
-    hold: ~w/greedy greedy_with_own stealy stacky adaptive nil/a
-  }
-
-  def random_new(),
-    do:
-      Enum.reduce(@strategy_options, %__MODULE__{}, fn {key, options}, acc ->
-        Map.update!(acc, key, fn
-          existing when is_list(existing) ->
-            [Enum.random(options)]
-
-          _ ->
-            Enum.random(options)
-        end)
-      end)
-
-  def crossover(p1, p2) do
-    Enum.reduce(@strategy_options, %__MODULE__{}, fn {key, options}, acc ->
+defmodule Helpers do
+  def crossover(%{__struct__: mod} = p1, p2, keys) do
+    Enum.reduce(keys, struct(mod), fn {key, options}, acc ->
       if :rand.uniform() > 0.8 do
         Map.update!(acc, key, fn
           existing when is_list(existing) ->
@@ -43,10 +15,7 @@ defmodule Player do
       end
     end)
   end
-  def age(players) when is_list(players), do: Enum.map(players, &Map.update!(&1, :age, fn age -> age + 1 end))
-end
 
-defmodule Strategy do
   def dice_points(dice) do
     dice
     |> Enum.frequencies()
@@ -54,29 +23,43 @@ defmodule Strategy do
     |> Enum.into(%{})
   end
 
-  def high_dice_ratio(dice, _thrown) do
-    {die, _ratio} =
-      dice
-      |> Enum.frequencies()
-      |> Enum.map(fn {die, amount} -> {die, 1 - amount / Game.points(die, amount)} end)
-      |> Enum.sort_by(&elem(&1, 1), :desc)
-      |> hd()
-
-    die
-  end
-
   def lowest_occurrence(dice, _thrown) do
-    {chosen, _occurence} = sort_by_lowest_occurrence(dice) |> hd()
+    {chosen, _occurence} = sort_by_occurrence(dice) |> hd()
     chosen
   end
 
-  defp sort_by_lowest_occurrence(dice),
+  def sort_by_occurrence(dice, order \\ :asc),
     do:
       dice
       |> Enum.frequencies()
-      |> Enum.sort_by(&elem(&1, 1), :asc)
+      |> Enum.sort_by(&elem(&1, 1), order)
 
-  def early_worm(dice, thrown) do
+  def sort_by_points(dice, order \\ :asc),
+    do: dice |> dice_points() |> Enum.sort_by(&elem(&1, 1), order)
+end
+
+defmodule Strategy do
+  import Helpers
+  defp call_strategy(func, thrown, eyes_to_take) when is_atom(func) do
+    apply(__MODULE__, func, [thrown, eyes_to_take])
+  end
+
+  defp call_strategy(%{__struct__: module} = strategy, thrown, eyes_to_take) do
+    module.call(thrown, eyes_to_take, strategy)
+  end
+
+  def high_dice_ratio(thrown, dice) do
+  {die, _ratio} =
+    dice
+    |> Enum.frequencies()
+    |> Enum.map(fn {die, amount} -> {die, 1 - amount / Game.points(die, amount)} end)
+    |> Enum.sort_by(&elem(&1, 1), :desc)
+    |> hd()
+
+  die
+  end
+
+  def early_worm(thrown, dice) do
     if 6 not in thrown and 6 in dice and length(Enum.filter(dice, &(&1 == 6))) > 1 do
       6
     else
@@ -84,15 +67,12 @@ defmodule Strategy do
     end
   end
 
-  defp sort_by_highest_points(dice),
-    do: dice |> dice_points() |> Enum.sort_by(&elem(&1, 1), :desc)
-
-  def highest_points(dice, _thrown) do
-    [{chosen, _points} | _] = sort_by_highest_points(dice)
+  def highest_points(_thrown, dice) do
+    [{chosen, _points} | _] = sort_by_points(dice, :desc)
     chosen
   end
 
-  def random(dice, _), do: Enum.random(dice)
+  def random(_, dice), do: Enum.random(dice)
 
   def adaptive(game, points) do
     case game.players[game.current_player] do
@@ -147,31 +127,119 @@ defmodule Strategy do
           {:halt, acc}
 
         func, acc ->
-          case apply(__MODULE__, func, [eyes_to_take, thrown]) do
+          case apply(__MODULE__, func, [thrown, eyes_to_take]) do
             nil -> {:cont, acc}
             chosen -> {:halt, chosen}
           end
       end)
 
-    chosen =
+    {chosen, game} =
       case break? do
-        nil ->
-          apply(__MODULE__, player.dice_strategy, [eyes_to_take, thrown])
+        nil -> {call_strategy(player.strategy, thrown, eyes_to_take), game}
 
+        {chosen, statistic} -> game =  update_in(game, [Access.key!(:players), game.current_player, Access.key!(:statistics), statistic], & &1 || 0 + 1)
+        {chosen, game}
         chosen ->
-          chosen
+          {chosen, game}
       end
 
     taken = Enum.filter(eyes_to_take, &(&1 == chosen))
     points = Game.points(thrown ++ taken)
 
     if hold_or_not = player.hold do
-      {taken, apply(__MODULE__, hold_or_not, [game, points])}
+      {taken, apply(__MODULE__, hold_or_not, [game, points]), game}
     else
-      {taken, :throw}
+      {taken, :throw, game}
     end
   end
+end  
+
+defmodule PreferSingle do
+  import Helpers
+  defstruct thrown: nil, break_point: nil, less_then: nil
+  @args [thrown: 0..4//1, break_point: 1..16//1, less_then: 1..3//1]
+
+  def new() do
+    Enum.reduce(@args, %__MODULE__{}, fn {key, range}, acc ->
+      Map.put(acc, key, Enum.random(range))
+    end)
+  end
+
+  def call(thrown, dice, args) do
+    [{lowest, _} | _] = sorted = sort_by_points(dice) 
+    {highest, points} = Enum.reverse(sorted) |> hd()
+
+
+    if length(thrown) < args.thrown and points < args.break_point and Enum.frequencies(dice)[highest] > args.less_then do
+      # {lowest_occurrence(dice, thrown), :prefer_single}
+      lowest
+    else
+      highest
+    end
+  end
+
+  def crossover(args1, args2), do: Helpers.crossover(args1, args2, @args)
 end
+
+defmodule Player do
+  defstruct age: 0,
+            stack: [],
+            breakers: [],
+            strategy: :highest_points,
+            hold: :greedy,
+            amount_of_invalid: 0,
+            amount_of_steal: 0,
+            amount_of_stack: 0,
+            total_best: 0,
+            statistics: %{},
+            wins: 0
+
+  @strategy_options %{
+    breakers: ~w/early_worm nil/a,
+    strategy: [%PreferSingle{}], # ++ ~w/high_dice_ratio highest_points random/a,
+    hold: ~w/greedy greedy_with_own stealy stacky adaptive nil/a
+  }
+
+  def random_new(players),
+    do:
+      Enum.reduce(@strategy_options, %__MODULE__{}, fn {key, options}, acc ->
+        Map.update!(acc, key, fn
+          existing when is_list(existing) ->
+            [Enum.random(options)]
+
+          _ ->
+            case Enum.random(options) do
+              %{__struct__: strategy} -> strategy.new()
+              strategy -> strategy
+            end
+        end)
+      end)
+      |> then(fn player ->
+        if Enum.map(players, &same?(player, elem(&1, 1))) |> Enum.any?() do
+          random_new(players)
+        else
+          player
+        end
+      end)
+
+  defp same?(player, other_player) do
+    keys = Map.keys(@strategy_options)
+
+    Enum.map([player, other_player], &Map.take(&1, keys))
+    |> Enum.uniq()
+    |> length() == 1
+  end
+
+  def crossover(%{strategy: %{__struct__: mod}} = p1, %{strategy: %{__struct__: mod}} = p2) do
+    Map.put(Helpers.crossover(p1, p2, Map.delete(@strategy_options, :strategy)), :strategy, mod.crossover(p1.strategy, p2.strategy))
+  end
+  def crossover(p1, p2), do: Helpers.crossover(p1, p2, @strategy_options)
+
+
+  def age(players) when is_list(players),
+    do: Enum.map(players, &Map.update!(&1, :age, fn age -> age + 1 end))
+end
+
 
 defmodule Game do
   defstruct players: [], stack: 21..36 |> Enum.to_list(), current_player: 0, turns: 0, winner: nil
@@ -202,8 +270,9 @@ defmodule Game do
   end
 
   def turn(%{players: players, current_player: current_player, stack: game_stack} = game) do
+    # IO.inspect(current_player, label: :Currnt)
     %{stack: player_stack} = players[current_player]
-    dice = throw_dice(game)
+    {dice, game} = throw_dice(game)
 
     if dice == :error do
       # IO.puts("invalid turn")
@@ -324,23 +393,10 @@ defmodule Game do
     pass? = Enum.at(player_stack, 0) == points
 
     if 6 in acc and (stack? or steal? or pass?) do
-      acc
+      {acc, game}
     else
-      :error
+      {:error, game}
     end
-    # |> then(fn result ->
-    #   if is_nil(hold) do
-    #     IO.inspect(acc, label: :taken)
-    #     IO.inspect(points, label: :points)
-    #     IO.inspect(game, label: :game)
-    #     IO.inspect(stack?, label: :stack)
-    #     IO.inspect(steal?, label: :steal)
-    #     IO.inspect(pass?, label: :pass)
-    #     IO.inspect(result, label: :result)
-    #   end
-
-    #   result
-    # end)
   end
 
   def throw_dice(game, amount_of_dice, acc) do
@@ -349,15 +405,15 @@ defmodule Game do
     eyes_to_take = thrown |> Enum.filter(&(&1 not in acc))
 
     if eyes_to_take == [] do
-      :error
+      {:error, game}
     else
-      {taken, next} = Strategy.decide(game, acc, eyes_to_take, player)
+      {taken, next, game} = Strategy.decide(game, acc, eyes_to_take, player)
       acc = acc ++ taken
 
       if next == :throw do
         throw_dice(game, amount_of_dice - length(taken), acc)
       else
-        acc
+        {acc, game}
       end
     end
   end
@@ -365,31 +421,22 @@ end
 
 defmodule Simulation do
   def run() do
-    Game.steal_card(
-      %{current_player: 0, players: %{0 => %{stack: []}, 1 => %{stack: [1]}}},
-      1
-    )
-
-    players =
-      Enum.reduce(0..5, %{}, fn index, acc ->
-        Map.put(acc, index, Player.random_new())
-      end)
-    |> Map.put(6, %Player{})
-
-    evaluate(players, 0, 10)
+    Enum.reduce(0..6, %{}, fn index, acc ->
+      Map.put(acc, index, Player.random_new(acc))
+    end)
+    |> Map.put(7, %Player{})
+    |> evaluate(0, 10)
   end
 
   def evaluate(players, current, max) do
-    keys = ~w[amount_of_invalid amount_of_steal amount_of_stack]a
-
-    Enum.reduce(1..1000, players, fn _, acc ->
+    Enum.reduce(1..100, players, fn _, acc ->
       case Game.new(players) |> Game.run() do
         %{winner: nil} ->
           acc
 
-      %{winner: index} = game ->
-        update_in(acc, [index, Access.key!(:wins)], &((game.winner == index && &1 + 1) || &1))
-        end
+        %{winner: index} = game ->
+          update_in(acc, [index, Access.key!(:wins)], &((game.winner == index && &1 + 1) || &1))
+      end
     end)
     |> mingle(current + 1, max)
   end
@@ -401,14 +448,35 @@ defmodule Simulation do
   end
 
   def mingle(players, current, max) do
-    [{_, best}, {_, second} | _] = Enum.sort_by( players ,&elem(&1, 1).wins, :desc)
+    [{_, best}, {_, second} | _] =
+      Enum.sort_by(
+        players,
+        fn {_, player} ->
+          player.wins * scale(player.total_best)
+        end,
+        :desc
+      )
 
-    Player.age([best, second]) ++ [ Player.crossover(best, second) | for(_ <- 0..2, do: Player.random_new())]
-    |> Enum.with_index()
-    |> Enum.map(fn {p, i} -> {i, %{p | stack: [], wins: 0}} end)
-    |> Enum.into(%{})
+    num_players = map_size(players)
+
+    offspring = [Player.crossover(best, second)]
+    surviving = (increment([increment(best, :total_best), second], :age) ++ offspring)
+
+      |> Enum.shuffle()
+      |> Enum.with_index()
+      |> Enum.map(fn {p, i} -> {i, %{p | stack: [], wins: 0}} end)
+      |> Enum.into(%{})
+
+    Enum.reduce(map_size(surviving)..(num_players - 1), surviving, fn index, acc ->
+      Map.put(acc, index, Player.random_new(acc))
+    end)
     |> evaluate(current, max)
   end
+
+  defp increment(enum, key) when is_list(enum), do: Enum.map(enum, &increment(&1, key))
+  defp increment(value, key), do: Map.update!(value, key, &(&1 + 1))
+  defp scale(0), do: 1
+  defp scale(v), do: 1 + v * 0.1
 end
 
 Simulation.run()
